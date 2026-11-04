@@ -2,7 +2,13 @@ const fs = require("fs");
 const path = require("path");
 const { backupToCloud } = require("./backup");
 const { createZaloManager } = require("./zalo");
-const { DEFAULT_CHAT_SYSTEM_PROMPT, cleanForChat } = require("./format");
+const {
+  DEFAULT_CHAT_SYSTEM_PROMPT,
+  DEFAULT_IMAGE_PROMPT,
+  downloadImageAsDataUrl,
+  buildVisionContent,
+  cleanForChat,
+} = require("./format");
 
 const MAX_HISTORY_MESSAGES = 20;
 const MAX_TELEGRAM_LENGTH = 4000;
@@ -59,6 +65,7 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
 
   let persisted = loadBotConfig(configPath);
   const histories = new Map(); // chatId -> Array<{ role, content }>
+  const pendingImages = new Map(); // chatId -> { fileId, ts }
   let running = true;
   let pollAbort = null;
   let botUsername = "";
@@ -471,12 +478,38 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
     return false;
   }
 
+  function extractTelegramImageFileId(m) {
+    if (!m) return null;
+    if (Array.isArray(m.photo) && m.photo.length > 0) {
+      return m.photo[m.photo.length - 1].file_id;
+    }
+    if (m.document && typeof m.document.mime_type === "string" && m.document.mime_type.startsWith("image/")) {
+      if (!m.document.file_size || m.document.file_size <= 12 * 1024 * 1024) {
+        return m.document.file_id;
+      }
+    }
+    return null;
+  }
+
+  async function downloadTelegramFileAsDataUrl(fileId) {
+    const fileInfo = await tgCall("getFile", { file_id: fileId });
+    if (!fileInfo || !fileInfo.file_path) {
+      throw new Error("Không lấy được đường dẫn ảnh từ Telegram.");
+    }
+    const fileUrl = `https://api.telegram.org/file/bot${botToken}/${fileInfo.file_path}`;
+    return downloadImageAsDataUrl(fileUrl);
+  }
+
   async function handleChatMessage(msg) {
     const chatId = msg.chat.id;
     const userId = msg.from?.id;
     const isGroup = msg.chat.type === "group" || msg.chat.type === "supergroup";
     let text = (msg.text || msg.caption || "").trim();
-    if (!text) return;
+
+    const directImageId = extractTelegramImageFileId(msg);
+    const repliedImageId = extractTelegramImageFileId(msg.reply_to_message);
+
+    if (!text && !directImageId) return;
 
     if (!isAuthorized(userId)) {
       if (!isGroup) {
@@ -485,11 +518,20 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
       return;
     }
 
+    let targetImageId = directImageId || repliedImageId || null;
+
     // Handle /ask or /ai command in groups & private chat
     if (/^\/(ask|ai)(@\S+)?(\s+|$)/i.test(text)) {
       text = text.replace(/^\/(ask|ai)(@\S+)?\s*/i, "").trim();
-      if (!text) {
-        await sendReply(chatId, "Cách dùng: `/ask <nội dung câu hỏi>`", {
+      if (!targetImageId) {
+        const pending = pendingImages.get(String(chatId));
+        if (pending && Date.now() - pending.ts < 2 * 60 * 1000) {
+          targetImageId = pending.fileId;
+          pendingImages.delete(String(chatId));
+        }
+      }
+      if (!text && !targetImageId) {
+        await sendReply(chatId, "Cách dùng: `/ask <nội dung câu hỏi>` (có thể kèm ảnh hoặc Reply vào ảnh)", {
           reply_to_message_id: msg.message_id,
         });
         return;
@@ -504,13 +546,30 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
       const isMentioned = Boolean(mentionRegex && mentionRegex.test(text));
 
       if (groupMode !== "all" && !isReplyToBot && !isMentioned) {
-        return; // Ignore normal group chatter unless mentioned, replied to, or /groupmode all
+        // Remember recent image in group for 2 minutes in case user types /ask right after
+        if (directImageId) {
+          pendingImages.set(String(chatId), { fileId: directImageId, ts: Date.now() });
+        }
+        return;
       }
 
       if (isMentioned && mentionRegex) {
         text = text.replace(mentionRegex, "").trim();
-        if (!text) return;
       }
+
+      if (!targetImageId) {
+        const pending = pendingImages.get(String(chatId));
+        if (pending && Date.now() - pending.ts < 2 * 60 * 1000) {
+          targetImageId = pending.fileId;
+          pendingImages.delete(String(chatId));
+        }
+      }
+
+      if (!text && !targetImageId) return;
+    }
+
+    if (targetImageId) {
+      pendingImages.delete(String(chatId));
     }
 
     const replyExtra = isGroup ? { reply_to_message_id: msg.message_id } : {};
@@ -535,26 +594,35 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
       return;
     }
 
-    const key = String(chatId);
-    const history = histories.get(key) || [];
-    history.push({ role: "user", content: text });
-    while (history.length > MAX_HISTORY_MESSAGES) {
-      history.shift();
-    }
-    histories.set(key, history);
-
-    const sysPrompt = getSystemPrompt(chatId);
-    const messages = sysPrompt
-      ? [{ role: "system", content: sysPrompt }, ...history]
-      : [...history];
-
-    // Keep sending typing indicator while AI thinks
+    // Keep sending typing indicator while downloading image & waiting for AI
     tgCall("sendChatAction", { chat_id: chatId, action: "typing" }).catch(() => {});
     const typingTimer = setInterval(() => {
       tgCall("sendChatAction", { chat_id: chatId, action: "typing" }).catch(() => {});
     }, 4000);
 
+    const key = String(chatId);
+    const history = histories.get(key) || [];
+    let pushedTurn = false;
+
     try {
+      let userMessageContent = text || DEFAULT_IMAGE_PROMPT;
+      if (targetImageId) {
+        const dataUrl = await downloadTelegramFileAsDataUrl(targetImageId);
+        userMessageContent = buildVisionContent(text, [dataUrl]);
+      }
+
+      history.push({ role: "user", content: userMessageContent });
+      pushedTurn = true;
+      while (history.length > MAX_HISTORY_MESSAGES) {
+        history.shift();
+      }
+      histories.set(key, history);
+
+      const sysPrompt = getSystemPrompt(chatId);
+      const messages = sysPrompt
+        ? [{ role: "system", content: sysPrompt }, ...history]
+        : [...history];
+
       const res = await fetch(`${routerBase}/chat/completions`, {
         method: "POST",
         headers: {
@@ -580,6 +648,14 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
         "(AI không trả về nội dung văn bản)";
       const replyContent = cleanForChat(rawReply);
 
+      // Replace large base64 image in history with compact text note to save RAM & tokens
+      if (targetImageId && history.length > 0) {
+        history[history.length - 1] = {
+          role: "user",
+          content: `[Người dùng gửi 1 bức ảnh] ${text || DEFAULT_IMAGE_PROMPT}`,
+        };
+      }
+
       history.push({ role: "assistant", content: replyContent });
       while (history.length > MAX_HISTORY_MESSAGES) {
         history.shift();
@@ -587,9 +663,11 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
 
       await sendReply(chatId, replyContent, replyExtra);
     } catch (err) {
-      // Roll back failed user turn so context stays clean
-      history.pop();
-      await sendReply(chatId, `❌ Lỗi gọi 9Router (model: ${model}):\n${err.message}`, replyExtra);
+      if (pushedTurn) history.pop();
+      const visionHint = targetImageId
+        ? "\n💡 Lưu ý: Hãy chắc chắn Model/Combo đang chọn có hỗ trợ đọc ảnh (Vision) hoặc đã bật Vision Adapter trong 9Router."
+        : "";
+      await sendReply(chatId, `❌ Lỗi gọi 9Router (model: ${model}):\n${err.message}${visionHint}`, replyExtra);
     } finally {
       clearInterval(typingTimer);
     }

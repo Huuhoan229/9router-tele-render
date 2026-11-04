@@ -6,6 +6,60 @@ const DEFAULT_CHAT_SYSTEM_PROMPT = [
   "3. Chia thành các đoạn ngắn 2-3 câu, cách nhau 1 dòng trống để dễ đọc trên màn hình điện thoại.",
 ].join("\n");
 
+const DEFAULT_IMAGE_PROMPT =
+  "Hãy xem bức ảnh này và trả lời trọng tâm nội dung trong ảnh bằng tiếng Việt (nếu là câu hỏi/bài tập thì giải chi tiết ngắn gọn, nếu là văn bản ngoại ngữ thì dịch hoặc giải thích ý chính, nếu là ảnh thường thì mô tả rõ trọng tâm).";
+
+/**
+ * Download an image URL and return a base64 Data URI (`data:image/jpeg;base64,...`).
+ * Limits download size to 12 MB to protect Render Free 512MB RAM.
+ */
+async function downloadImageAsDataUrl(url, extraHeaders = {}) {
+  const res = await fetch(url, { headers: extraHeaders });
+  if (!res.ok) {
+    throw new Error(`Không tải được ảnh (HTTP ${res.status})`);
+  }
+
+  const contentLength = Number(res.headers.get("content-length") || 0);
+  if (contentLength > 12 * 1024 * 1024) {
+    throw new Error("Ảnh quá lớn (> 12MB), vui lòng gửi ảnh nhẹ hơn.");
+  }
+
+  const arrayBuf = await res.arrayBuffer();
+  if (arrayBuf.byteLength > 12 * 1024 * 1024) {
+    throw new Error("Ảnh quá lớn (> 12MB), vui lòng gửi ảnh nhẹ hơn.");
+  }
+
+  let mime = (res.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+  if (!mime.startsWith("image/")) {
+    const lowerUrl = url.toLowerCase();
+    if (lowerUrl.includes(".png")) mime = "image/png";
+    else if (lowerUrl.includes(".webp")) mime = "image/webp";
+    else if (lowerUrl.includes(".gif")) mime = "image/gif";
+    else mime = "image/jpeg";
+  }
+
+  const b64 = Buffer.from(arrayBuf).toString("base64");
+  return `data:${mime};base64,${b64}`;
+}
+
+/**
+ * Build OpenAI-compatible multimodal content array for 9Router `/v1/chat/completions`.
+ */
+function buildVisionContent(promptText, imageDataUrls) {
+  const finalPrompt = (promptText || "").trim() || DEFAULT_IMAGE_PROMPT;
+  if (!imageDataUrls || imageDataUrls.length === 0) {
+    return finalPrompt;
+  }
+  const parts = [{ type: "text", text: finalPrompt }];
+  for (const dataUrl of imageDataUrls) {
+    parts.push({
+      type: "image_url",
+      image_url: { url: dataUrl },
+    });
+  }
+  return parts;
+}
+
 /**
  * Strip stray Markdown formatting (**bold**, ### headers, etc.) outside fenced code blocks
  * so messages always look clean in plain-text Telegram & Zalo chats.
@@ -47,5 +101,8 @@ function cleanForChat(text) {
 
 module.exports = {
   DEFAULT_CHAT_SYSTEM_PROMPT,
+  DEFAULT_IMAGE_PROMPT,
+  downloadImageAsDataUrl,
+  buildVisionContent,
   cleanForChat,
 };
