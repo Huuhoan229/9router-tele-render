@@ -66,7 +66,21 @@ function startTelegramBot({ port, dataDir }) {
     .filter(Boolean);
 
   function getApiKey() {
-    return (persisted.routerApiKey || process.env.ROUTER_API_KEY || "").trim();
+    const manual = (persisted.routerApiKey || process.env.ROUTER_API_KEY || "").trim();
+    if (manual) return manual;
+
+    // Auto-read active API Key directly from 9Router SQLite database if available
+    try {
+      const dbPath = path.join(dataDir, "db", "data.sqlite");
+      if (fs.existsSync(dbPath)) {
+        const { DatabaseSync } = require("node:sqlite");
+        const db = new DatabaseSync(dbPath, { open: true, readOnly: true });
+        const row = db.prepare("SELECT key FROM apiKeys WHERE isActive = 1 LIMIT 1").get();
+        db.close();
+        if (row && row.key) return String(row.key).trim();
+      }
+    } catch {}
+    return "";
   }
 
   function getActiveModel(chatId) {
@@ -115,18 +129,35 @@ function startTelegramBot({ port, dataDir }) {
   }
 
   async function fetchAvailableModels() {
+    const comboNames = [];
+    try {
+      const dbPath = path.join(dataDir, "db", "data.sqlite");
+      if (fs.existsSync(dbPath)) {
+        const { DatabaseSync } = require("node:sqlite");
+        const db = new DatabaseSync(dbPath, { open: true, readOnly: true });
+        const rows = db.prepare("SELECT name FROM combos").all();
+        db.close();
+        for (const r of rows) {
+          if (r && r.name) comboNames.push(String(r.name).trim());
+        }
+      }
+    } catch {}
+
     const apiKey = getApiKey();
     const headers = {};
     if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
 
-    const res = await fetch(`${routerBase}/models`, { headers });
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      throw new Error(`9Router /v1/models trả về lỗi ${res.status}: ${txt.slice(0, 200)}`);
-    }
-    const json = await res.json();
-    const list = Array.isArray(json?.data) ? json.data : [];
-    return list.map((m) => m.id).filter(Boolean);
+    try {
+      const res = await fetch(`${routerBase}/models`, { headers });
+      if (res.ok) {
+        const json = await res.json();
+        const list = Array.isArray(json?.data) ? json.data : [];
+        const apiModels = list.map((m) => m.id).filter(Boolean);
+        return [...new Set([...comboNames, ...apiModels])];
+      }
+    } catch {}
+
+    return comboNames;
   }
 
   async function ensureModelSelected(chatId) {
@@ -482,3 +513,4 @@ function startTelegramBot({ port, dataDir }) {
 }
 
 module.exports = { startTelegramBot };
+
