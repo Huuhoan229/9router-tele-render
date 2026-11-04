@@ -2,10 +2,12 @@ services:
   - type: web
     name: 9router-tele-bot
     runtime: docker
+    repo: https://github.com/Huuhoan229/9router-tele-render
+    branch: main
+    dockerfilePath: ./Dockerfile
     plan: free
     region: singapore
     healthCheckPath: /
-    autoDeploy: true
     envVars:
       - key: NODE_ENV
         value: production
@@ -25,9 +27,3 @@ services:
         sync: false
       - key: GITHUB_TOKEN
         sync: false
-      - key: ROUTER_API_KEY
-        value: ""
-      - key: DEFAULT_MODEL
-        value: ""
-      - key: ALLOWED_TELEGRAM_IDS
-        value: ""
