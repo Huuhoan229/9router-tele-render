@@ -1,0 +1,8 @@
+{
+  "name": "9router-tele-zalo-runner",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "zca-js": "^2.2.0"
+  }
+}

@@ -72,3 +72,4 @@ Khi `9router` có bản cập nhật mới:
 1. *(An toàn tuyệt đối)* Gõ `/backup` trên Telegram để ép lưu cấu hình mới nhất lên GitHub Gist.
 2. Vào Dashboard của Render -> chọn service `9router-tele-bot` -> bấm **Manual Deploy** -> **Clear build cache & deploy**.
 3. Render sẽ tự động kéo bản `decolua/9router:latest` mới nhất về và tự khôi phục 100% tài khoản AI, OAuth token, Combo của bạn!
+

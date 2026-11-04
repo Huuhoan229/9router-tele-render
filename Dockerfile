@@ -8,7 +8,10 @@ RUN mkdir -p /app/data /home/node && \
     ln -s /app/data /home/node/.9router && \
     chown -R node:node /app/data /home/node
 
-# Copy supervisor, Telegram Bot, and GitHub Gist Auto-Backup scripts
+# Copy runner scripts and install Zalo Personal Bot library (zca-js)
+COPY --chown=node:node runner/package.json /app/runner/package.json
+RUN cd /app/runner && npm install --omit=dev --no-audit --no-fund && chown -R node:node /app/runner
+
 COPY --chown=node:node runner/ /app/runner/
 
 ENV NODE_ENV=production \
@@ -19,4 +22,4 @@ ENV NODE_ENV=production \
 EXPOSE 20128
 
 # Base image /entrypoint.sh fixes permissions on /app/data and runs CMD as `node`
-CMD ["node", "--dns-result-order=ipv4first", "--max-old-space-size=96", "/app/runner/start.js"]
+CMD ["node", "--dns-result-order=ipv4first", "--max-old-space-size=128", "/app/runner/start.js"]

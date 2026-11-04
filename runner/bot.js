@@ -1,6 +1,7 @@
 const fs = require("fs");
 const path = require("path");
 const { backupToCloud } = require("./backup");
+const { createZaloManager } = require("./zalo");
 
 const MAX_HISTORY_MESSAGES = 20;
 const MAX_TELEGRAM_LENGTH = 4000;
@@ -44,7 +45,7 @@ function splitLongText(text, maxLen = MAX_TELEGRAM_LENGTH) {
   return chunks;
 }
 
-function startTelegramBot({ port, dataDir }) {
+function startTelegramBot({ port, dataDir, zaloManager }) {
   const botToken = (process.env.TELEGRAM_BOT_TOKEN || "").trim();
   if (!botToken) {
     console.warn("[TeleBot] TELEGRAM_BOT_TOKEN chưa được cài đặt — chỉ chạy 9Router Web/API.");
@@ -100,6 +101,23 @@ function startTelegramBot({ port, dataDir }) {
     return (prompts[String(chatId)] || process.env.SYSTEM_PROMPT || "").trim();
   }
 
+  if (!zaloManager) {
+    try {
+      zaloManager = createZaloManager({
+        port,
+        dataDir,
+        getApiKey,
+        getDefaultModel: () => getActiveModel("default") || "a",
+        getSystemPrompt: () => getSystemPrompt("default"),
+      });
+      zaloManager.tryAutoLogin().catch((err) =>
+        console.error("[ZaloBot] Auto-login check error:", err.message)
+      );
+    } catch (err) {
+      console.error("[ZaloBot] Failed to init ZaloManager:", err.message);
+    }
+  }
+
   async function tgCall(method, body = {}, signal) {
     const res = await fetch(`${tgBase}/${method}`, {
       method: "POST",
@@ -110,6 +128,23 @@ function startTelegramBot({ port, dataDir }) {
     const data = await res.json().catch(() => ({ ok: false, description: `HTTP ${res.status}` }));
     if (!data.ok) {
       throw new Error(`Telegram ${method} error: ${data.description || res.status}`);
+    }
+    return data.result;
+  }
+
+  async function sendPhotoBuffer(chatId, pngBuffer, caption = "") {
+    const form = new FormData();
+    form.append("chat_id", String(chatId));
+    if (caption) form.append("caption", caption);
+    form.append("photo", new Blob([pngBuffer], { type: "image/png" }), "zalo-qr.png");
+
+    const res = await fetch(`${tgBase}/sendPhoto`, {
+      method: "POST",
+      body: form,
+    });
+    const data = await res.json().catch(() => ({ ok: false }));
+    if (!data.ok) {
+      throw new Error(`sendPhoto failed: ${data.description || res.status}`);
     }
     return data.result;
   }
@@ -203,6 +238,9 @@ function startTelegramBot({ port, dataDir }) {
         "*Các lệnh điều khiển:*",
         "• `/ask <câu hỏi>` — Hỏi AI trong nhóm chung (hoặc tag `@" + (botUsername || "bot") + "`, hoặc Reply tin nhắn của bot)",
         "• `/groupmode all` | `mention` — Bật trả lời mọi tin nhắn trong nhóm (`all`) hoặc chỉ khi được gọi (`mention`)",
+        "• `/zaloqr` — Lấy mã QR quét kết nối tài khoản **Zalo cá nhân** làm Bot",
+        "• `/zalomode dm` | `command` | `all` | `off` — Chỉnh chế độ tự trả lời trên Zalo",
+        "• `/zalostatus` — Kiểm tra trạng thái kết nối Zalo cá nhân",
         "• `/setkey <key>` — Gắn API Key tạo trong Dashboard 9Router",
         "• `/models` — Hiện nút bấm chọn Model / Combo từ 9Router",
         "• `/model <tên_model>` — Nhập tay tên Model hoặc Combo",
@@ -213,6 +251,72 @@ function startTelegramBot({ port, dataDir }) {
       await sendReply(chatId, lines.join("\n"), { parse_mode: "Markdown" }).catch(() =>
         sendReply(chatId, lines.join("\n").replace(/[*`]/g, ""))
       );
+      return true;
+    }
+
+    if (cmd === "/zaloqr" || cmd === "/zalologin") {
+      if (!zaloManager) {
+        await sendReply(chatId, "⚠️ Module Zalo chưa được khởi tạo.");
+        return true;
+      }
+      await sendReply(chatId, "⏳ Đang khởi tạo mã QR đăng nhập Zalo cá nhân, đợi 2 giây...");
+      zaloManager
+        .startQRLoginFlow({
+          onQRImage: async (pngBuf) => {
+            await sendPhotoBuffer(
+              chatId,
+              pngBuf,
+              "📱 Mở app Zalo trên điện thoại -> Quét mã QR này để kết nối tài khoản Zalo cá nhân làm Bot!\n(Mã có hiệu lực trong ~60 giây)"
+            );
+          },
+          onScanned: async (name) => {
+            await sendReply(
+              chatId,
+              `👀 Đã nhận quét QR từ Zalo: ${name}!\n👉 Hãy bấm nút "Đăng nhập" trên màn hình điện thoại của bạn...`
+            );
+          },
+          onSuccess: async ({ ownId, accountName }) => {
+            await sendReply(
+              chatId,
+              `✅ Kết nối Zalo cá nhân thành công!\n• Tài khoản: ${accountName || ownId || "Đã kết nối"}\n• Chế độ Zalo hiện tại: ${zaloManager.getZaloMode()}\n• Đã tự động sao lưu phiên đăng nhập Zalo lên GitHub Secret Gist (không cần quét lại khi server restart)!\n\n💡 Mẹo: Gõ /zalomode command nếu chỉ muốn Bot trả lời trên Zalo khi có chữ /ask ở đầu, hoặc /zalomode dm để trả lời mọi tin nhắn 1-1.`
+            );
+          },
+          onError: async (err) => {
+            await sendReply(chatId, `⚠️ Phiên quét QR Zalo kết thúc: ${err.message}\nGõ /zaloqr để tạo mã mới.`);
+          },
+        })
+        .catch((err) => sendReply(chatId, `⚠️ ${err.message}`));
+      return true;
+    }
+
+    if (cmd === "/zalostatus") {
+      if (!zaloManager) {
+        await sendReply(chatId, "⚠️ Module Zalo chưa được khởi tạo.");
+        return true;
+      }
+      const st = zaloManager.getStatus();
+      await sendReply(
+        chatId,
+        `📱 Trạng thái Zalo cá nhân:\n• Kết nối: ${st.connected ? "✅ Đang hoạt động" : "❌ Chưa kết nối (gõ /zaloqr để quét mã)"}\n• Tên / UID: ${st.accountName || st.ownId || "(Chưa có)"}\n• Chế độ trả lời (/zalomode): ${st.mode}`
+      );
+      return true;
+    }
+
+    if (cmd === "/zalomode") {
+      if (!zaloManager) {
+        await sendReply(chatId, "⚠️ Module Zalo chưa được khởi tạo.");
+        return true;
+      }
+      const m = argText.toLowerCase();
+      if (!["dm", "command", "all", "off"].includes(m)) {
+        await sendReply(
+          chatId,
+          `Chế độ Zalo hiện tại: ${zaloManager.getZaloMode()}\n\nCác chế độ hỗ trợ:\n• /zalomode dm — Trả lời mọi tin nhắn riêng 1-1; trong nhóm chỉ trả lời khi @Tag hoặc gõ /ask\n• /zalomode command — Chỉ trả lời khi tin nhắn có /ask hoặc /ai ở đầu (an toàn cho nick Zalo chính)\n• /zalomode all — Trả lời tất cả tin nhắn ở cả 1-1 và mọi nhóm Zalo\n• /zalomode off — Tạm tắt trả lời trên Zalo`
+        );
+        return true;
+      }
+      zaloManager.setZaloMode(m);
+      await sendReply(chatId, `✅ Đã đổi chế độ trả lời Zalo sang: ${m}`);
       return true;
     }
 

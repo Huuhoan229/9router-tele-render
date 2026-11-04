@@ -105,6 +105,7 @@ function buildBackupMap(dataDir) {
     "jwt-secret",
     "machine-id",
     "telebot-config.json",
+    "zalo-credentials.json",
     "db.json",
     "auth/cli-secret",
     "db/.migrated-from-json",
@@ -266,3 +267,4 @@ module.exports = {
   restoreFromCloud,
   backupToCloud,
 };
+
