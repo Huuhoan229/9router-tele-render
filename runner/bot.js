@@ -59,6 +59,8 @@ function startTelegramBot({ port, dataDir }) {
   const histories = new Map(); // chatId -> Array<{ role, content }>
   let running = true;
   let pollAbort = null;
+  let botUsername = "";
+  let botId = null;
 
   const allowedIds = (process.env.ALLOWED_TELEGRAM_IDS || "")
     .split(",")
@@ -199,6 +201,8 @@ function startTelegramBot({ port, dataDir }) {
         `• *Model đang dùng:* \`${currentModel}\``,
         "",
         "*Các lệnh điều khiển:*",
+        "• `/ask <câu hỏi>` — Hỏi AI trong nhóm chung (hoặc tag `@" + (botUsername || "bot") + "`, hoặc Reply tin nhắn của bot)",
+        "• `/groupmode all` | `mention` — Bật trả lời mọi tin nhắn trong nhóm (`all`) hoặc chỉ khi được gọi (`mention`)",
         "• `/setkey <key>` — Gắn API Key tạo trong Dashboard 9Router",
         "• `/models` — Hiện nút bấm chọn Model / Combo từ 9Router",
         "• `/model <tên_model>` — Nhập tay tên Model hoặc Combo",
@@ -208,6 +212,29 @@ function startTelegramBot({ port, dataDir }) {
       ];
       await sendReply(chatId, lines.join("\n"), { parse_mode: "Markdown" }).catch(() =>
         sendReply(chatId, lines.join("\n").replace(/[*`]/g, ""))
+      );
+      return true;
+    }
+
+    if (cmd === "/groupmode") {
+      persisted.groupModes = persisted.groupModes || {};
+      const mode = argText.toLowerCase();
+      if (mode !== "all" && mode !== "mention") {
+        const cur = persisted.groupModes[String(chatId)] || "mention";
+        await sendReply(
+          chatId,
+          `Chế độ nhóm hiện tại: ${cur}\n• Gõ /groupmode all để Bot trả lời MỌI tin nhắn trong nhóm (nhớ tắt Privacy ở @BotFather hoặc cấp quyền Admin cho Bot).\n• Gõ /groupmode mention để chỉ trả lời khi tag @${botUsername || "bot"}, Reply tin nhắn của bot, hoặc gõ /ask.`
+        );
+        return true;
+      }
+      persisted.groupModes[String(chatId)] = mode;
+      saveBotConfig(configPath, persisted);
+      backupToCloud(dataDir).catch(() => {});
+      await sendReply(
+        chatId,
+        mode === "all"
+          ? "✅ Đã bật chế độ `all`: Bot sẽ trả lời mọi tin nhắn trong nhóm này!"
+          : "✅ Đã bật chế độ `mention`: Bot chỉ trả lời khi được tag, Reply, hoặc dùng `/ask`."
       );
       return true;
     }
@@ -334,24 +361,53 @@ function startTelegramBot({ port, dataDir }) {
   async function handleChatMessage(msg) {
     const chatId = msg.chat.id;
     const userId = msg.from?.id;
-    const text = (msg.text || "").trim();
+    const isGroup = msg.chat.type === "group" || msg.chat.type === "supergroup";
+    let text = (msg.text || msg.caption || "").trim();
     if (!text) return;
 
     if (!isAuthorized(userId)) {
-      await sendReply(chatId, `⛔ Bạn không có quyền sử dụng bot này (ID của bạn: ${userId}).`);
+      if (!isGroup) {
+        await sendReply(chatId, `⛔ Bạn không có quyền sử dụng bot này (ID của bạn: ${userId}).`);
+      }
       return;
     }
 
-    if (text.startsWith("/")) {
+    // Handle /ask or /ai command in groups & private chat
+    if (/^\/(ask|ai)(@\S+)?(\s+|$)/i.test(text)) {
+      text = text.replace(/^\/(ask|ai)(@\S+)?\s*/i, "").trim();
+      if (!text) {
+        await sendReply(chatId, "Cách dùng: `/ask <nội dung câu hỏi>`", {
+          reply_to_message_id: msg.message_id,
+        });
+        return;
+      }
+    } else if (text.startsWith("/")) {
       const handled = await handleCommand(msg, text);
       if (handled) return;
+    } else if (isGroup) {
+      const groupMode = (persisted.groupModes && persisted.groupModes[String(chatId)]) || "mention";
+      const isReplyToBot = Boolean(botId && msg.reply_to_message?.from?.id === botId);
+      const mentionRegex = botUsername ? new RegExp(`@${botUsername}\\b`, "i") : null;
+      const isMentioned = Boolean(mentionRegex && mentionRegex.test(text));
+
+      if (groupMode !== "all" && !isReplyToBot && !isMentioned) {
+        return; // Ignore normal group chatter unless mentioned, replied to, or /groupmode all
+      }
+
+      if (isMentioned && mentionRegex) {
+        text = text.replace(mentionRegex, "").trim();
+        if (!text) return;
+      }
     }
+
+    const replyExtra = isGroup ? { reply_to_message_id: msg.message_id } : {};
 
     const apiKey = getApiKey();
     if (!apiKey) {
       await sendReply(
         chatId,
-        "⚠️ Chưa có API Key kết nối 9Router!\n\n1. Vào trang quản trị 9Router mục Endpoint & Key để tạo API Key.\n2. Quay lại đây gõ:\n/setkey <API_KEY_CỦA_BẠN>"
+        "⚠️ Chưa có API Key kết nối 9Router!\n\n1. Vào trang quản trị 9Router mục Endpoint & Key để tạo API Key.\n2. Quay lại đây gõ:\n/setkey <API_KEY_CỦA_BẠN>",
+        replyExtra
       );
       return;
     }
@@ -360,7 +416,8 @@ function startTelegramBot({ port, dataDir }) {
     if (!model) {
       await sendReply(
         chatId,
-        "⚠️ Chưa chọn Model/Combo nào! Hãy vào Dashboard 9Router gắn AI hoặc tạo Combo trước, sau đó gõ:\n/model <tên_model_hoặc_combo>"
+        "⚠️ Chưa chọn Model/Combo nào! Hãy vào Dashboard 9Router gắn AI hoặc tạo Combo trước, sau đó gõ:\n/model <tên_model_hoặc_combo>",
+        replyExtra
       );
       return;
     }
@@ -414,11 +471,11 @@ function startTelegramBot({ port, dataDir }) {
         history.shift();
       }
 
-      await sendReply(chatId, replyContent);
+      await sendReply(chatId, replyContent, replyExtra);
     } catch (err) {
       // Roll back failed user turn so context stays clean
       history.pop();
-      await sendReply(chatId, `❌ Lỗi gọi 9Router (model: ${model}):\n${err.message}`);
+      await sendReply(chatId, `❌ Lỗi gọi 9Router (model: ${model}):\n${err.message}`, replyExtra);
     } finally {
       clearInterval(typingTimer);
     }
@@ -460,6 +517,8 @@ function startTelegramBot({ port, dataDir }) {
     try {
       await tgCall("deleteWebhook", { drop_pending_updates: false });
       const me = await tgCall("getMe");
+      botUsername = me.username || "";
+      botId = me.id || null;
       console.log(`[TeleBot] Started successfully as @${me.username} (connected to ${routerBase})`);
     } catch (err) {
       console.error("[TeleBot] Startup check failed (check TELEGRAM_BOT_TOKEN):", err.message);
