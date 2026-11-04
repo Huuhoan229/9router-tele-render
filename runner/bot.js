@@ -1,5 +1,6 @@
 const fs = require("fs");
 const path = require("path");
+const https = require("https");
 const { backupToCloud } = require("./backup");
 const { createZaloManager } = require("./zalo");
 const {
@@ -131,18 +132,66 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
     }
   }
 
-  async function tgCall(method, body = {}, signal) {
-    const res = await fetch(`${tgBase}/${method}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal,
+  function tgCall(method, body = {}, signal) {
+    return new Promise((resolve, reject) => {
+      const payload = Buffer.from(JSON.stringify(body), "utf8");
+      const req = https.request(
+        `${tgBase}/${method}`,
+        {
+          method: "POST",
+          family: 4,
+          agent: false,
+          timeout: 30000,
+          headers: {
+            "Content-Type": "application/json",
+            "Content-Length": payload.length,
+          },
+        },
+        (res) => {
+          const chunks = [];
+          res.on("data", (c) => chunks.push(c));
+          res.on("end", () => {
+            const raw = Buffer.concat(chunks).toString("utf8");
+            let data;
+            try {
+              data = JSON.parse(raw);
+            } catch {
+              data = { ok: false, description: `HTTP ${res.statusCode}` };
+            }
+            if (!data.ok) {
+              return reject(new Error(`Telegram ${method} error: ${data.description || res.statusCode}`));
+            }
+            resolve(data.result);
+          });
+        }
+      );
+
+      if (signal) {
+        if (signal.aborted) {
+          req.destroy();
+          const abortErr = new Error("Aborted");
+          abortErr.name = "AbortError";
+          return reject(abortErr);
+        }
+        signal.addEventListener(
+          "abort",
+          () => {
+            req.destroy();
+            const abortErr = new Error("Aborted");
+            abortErr.name = "AbortError";
+            reject(abortErr);
+          },
+          { once: true }
+        );
+      }
+
+      req.on("timeout", () => {
+        req.destroy(new Error("Telegram request timeout"));
+      });
+      req.on("error", (err) => reject(err));
+      req.write(payload);
+      req.end();
     });
-    const data = await res.json().catch(() => ({ ok: false, description: `HTTP ${res.status}` }));
-    if (!data.ok) {
-      throw new Error(`Telegram ${method} error: ${data.description || res.status}`);
-    }
-    return data.result;
   }
 
   async function sendPhotoBuffer(chatId, pngBuffer, caption = "") {
@@ -723,7 +772,7 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
           "getUpdates",
           {
             offset,
-            timeout: 30,
+            timeout: 20,
             allowed_updates: ["message", "callback_query"],
           },
           pollAbort.signal
