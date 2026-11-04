@@ -2,6 +2,7 @@ const fs = require("fs");
 const path = require("path");
 const { Zalo, ThreadType, LoginQRCallbackEventType } = require("zca-js");
 const { backupToCloud } = require("./backup");
+const { DEFAULT_CHAT_SYSTEM_PROMPT, cleanForChat } = require("./format");
 
 const MAX_HISTORY_MESSAGES = 20;
 
@@ -65,10 +66,8 @@ function createZaloManager({ port, dataDir, getApiKey, getDefaultModel, getSyste
     }
     histories.set(key, history);
 
-    const sysPrompt = getSystemPrompt ? getSystemPrompt() : "";
-    const messages = sysPrompt
-      ? [{ role: "system", content: sysPrompt }, ...history]
-      : [...history];
+    const sysPrompt = (getSystemPrompt ? getSystemPrompt() : "") || DEFAULT_CHAT_SYSTEM_PROMPT;
+    const messages = [{ role: "system", content: sysPrompt }, ...history];
 
     try {
       const res = await fetch(`${routerBase}/chat/completions`, {
@@ -90,10 +89,11 @@ function createZaloManager({ port, dataDir, getApiKey, getDefaultModel, getSyste
       }
 
       const data = JSON.parse(rawText);
-      const reply =
+      const rawReply =
         data?.choices?.[0]?.message?.content ||
         data?.content?.[0]?.text ||
         "(AI không trả về nội dung)";
+      const reply = cleanForChat(rawReply);
 
       history.push({ role: "assistant", content: reply });
       while (history.length > MAX_HISTORY_MESSAGES) {

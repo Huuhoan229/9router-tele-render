@@ -2,6 +2,7 @@ const fs = require("fs");
 const path = require("path");
 const { backupToCloud } = require("./backup");
 const { createZaloManager } = require("./zalo");
+const { DEFAULT_CHAT_SYSTEM_PROMPT, cleanForChat } = require("./format");
 
 const MAX_HISTORY_MESSAGES = 20;
 const MAX_TELEGRAM_LENGTH = 4000;
@@ -98,7 +99,12 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
 
   function getSystemPrompt(chatId) {
     const prompts = persisted.systemPrompts || {};
-    return (prompts[String(chatId)] || process.env.SYSTEM_PROMPT || "").trim();
+    return (
+      prompts[String(chatId)] ||
+      persisted.defaultSystemPrompt ||
+      process.env.SYSTEM_PROMPT ||
+      DEFAULT_CHAT_SYSTEM_PROMPT
+    ).trim();
   }
 
   if (!zaloManager) {
@@ -434,14 +440,17 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
       }
       if (argText.toLowerCase() === "clear") {
         delete persisted.systemPrompts[String(chatId)];
+        delete persisted.defaultSystemPrompt;
         saveBotConfig(configPath, persisted);
-        await sendReply(chatId, "✅ Đã xóa System Prompt về mặc định.");
+        backupToCloud(dataDir).catch(() => {});
+        await sendReply(chatId, "✅ Đã khôi phục System Prompt mặc định (Tiếng Việt ngắn gọn, không ký tự Markdown).");
         return true;
       }
       persisted.systemPrompts[String(chatId)] = argText;
+      persisted.defaultSystemPrompt = argText;
       saveBotConfig(configPath, persisted);
       backupToCloud(dataDir).catch(() => {});
-      await sendReply(chatId, "✅ Đã cập nhật System Prompt!");
+      await sendReply(chatId, "✅ Đã cập nhật System Prompt cho cả Telegram và Zalo!");
       return true;
     }
 
@@ -565,10 +574,11 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
       }
 
       const data = JSON.parse(rawText);
-      const replyContent =
+      const rawReply =
         data?.choices?.[0]?.message?.content ||
         data?.content?.[0]?.text ||
         "(AI không trả về nội dung văn bản)";
+      const replyContent = cleanForChat(rawReply);
 
       history.push({ role: "assistant", content: replyContent });
       while (history.length > MAX_HISTORY_MESSAGES) {
