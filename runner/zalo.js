@@ -5,6 +5,8 @@ const { backupToCloud } = require("./backup");
 const {
   DEFAULT_CHAT_SYSTEM_PROMPT,
   DEFAULT_IMAGE_PROMPT,
+  looksLikeBlindImageReply,
+  resolveVisionCandidates,
   downloadImageAsDataUrl,
   buildVisionContent,
   cleanForChat,
@@ -130,30 +132,57 @@ function createZaloManager({ port, dataDir, memoryStore: sharedMemory, getApiKey
         { role: "user", content: userContent },
       ];
 
-      const res = await fetch(`${routerBase}/chat/completions`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model,
-          messages,
-          stream: false,
-        }),
-      });
+      const candidateModels =
+        imageUrls.length > 0 ? resolveVisionCandidates(model, dataDir) : [model];
 
-      const rawText = await res.text();
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}: ${rawText.slice(0, 300)}`);
+      let rawReply = "";
+      let lastErr = null;
+
+      for (const candidate of candidateModels) {
+        try {
+          const res = await fetch(`${routerBase}/chat/completions`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${apiKey}`,
+            },
+            body: JSON.stringify({
+              model: candidate,
+              messages,
+              stream: false,
+            }),
+          });
+
+          const rawText = await res.text();
+          if (!res.ok) {
+            lastErr = new Error(`HTTP ${res.status}: ${rawText.slice(0, 300)}`);
+            continue;
+          }
+
+          const data = JSON.parse(rawText);
+          const contentCandidate =
+            data?.choices?.[0]?.message?.content ||
+            data?.content?.[0]?.text ||
+            "";
+
+          if (imageUrls.length > 0 && looksLikeBlindImageReply(contentCandidate) && candidate !== candidateModels[candidateModels.length - 1]) {
+            console.warn(`[ZaloBot] Model ${candidate} did not receive image_url, falling back to next Vision model...`);
+            continue;
+          }
+
+          rawReply = contentCandidate || "(AI không trả về nội dung)";
+          lastErr = null;
+          break;
+        } catch (e) {
+          lastErr = e;
+        }
       }
 
-      const data = JSON.parse(rawText);
-      const rawReply =
-        data?.choices?.[0]?.message?.content ||
-        data?.content?.[0]?.text ||
-        "(AI không trả về nội dung)";
-      const reply = cleanForChat(rawReply);
+      if (!rawReply && lastErr) {
+        throw lastErr;
+      }
+
+      const reply = cleanForChat(rawReply || "(AI không trả về nội dung)");
 
       const savedUserText =
         imageUrls.length > 0

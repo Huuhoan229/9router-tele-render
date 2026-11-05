@@ -7,6 +7,8 @@ const { createMemoryStore } = require("./memory");
 const {
   DEFAULT_CHAT_SYSTEM_PROMPT,
   DEFAULT_IMAGE_PROMPT,
+  looksLikeBlindImageReply,
+  resolveVisionCandidates,
   downloadImageAsDataUrl,
   buildVisionContent,
   cleanForChat,
@@ -692,30 +694,58 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
         { role: "user", content: userMessageContent },
       ];
 
-      const res = await fetch(`${routerBase}/chat/completions`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model,
-          messages,
-          stream: false,
-        }),
-      });
+      const candidateModels = targetImageId
+        ? resolveVisionCandidates(model, dataDir)
+        : [model];
 
-      const rawText = await res.text();
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}: ${rawText.slice(0, 400)}`);
+      let rawReply = "";
+      let lastErr = null;
+
+      for (const candidate of candidateModels) {
+        try {
+          const res = await fetch(`${routerBase}/chat/completions`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${apiKey}`,
+            },
+            body: JSON.stringify({
+              model: candidate,
+              messages,
+              stream: false,
+            }),
+          });
+
+          const rawText = await res.text();
+          if (!res.ok) {
+            lastErr = new Error(`HTTP ${res.status}: ${rawText.slice(0, 400)}`);
+            continue;
+          }
+
+          const data = JSON.parse(rawText);
+          const contentCandidate =
+            data?.choices?.[0]?.message?.content ||
+            data?.content?.[0]?.text ||
+            "";
+
+          if (targetImageId && looksLikeBlindImageReply(contentCandidate) && candidate !== candidateModels[candidateModels.length - 1]) {
+            console.warn(`[TeleBot] Model ${candidate} did not receive image_url, falling back to next Vision model...`);
+            continue;
+          }
+
+          rawReply = contentCandidate || "(AI không trả về nội dung văn bản)";
+          lastErr = null;
+          break;
+        } catch (e) {
+          lastErr = e;
+        }
       }
 
-      const data = JSON.parse(rawText);
-      const rawReply =
-        data?.choices?.[0]?.message?.content ||
-        data?.content?.[0]?.text ||
-        "(AI không trả về nội dung văn bản)";
-      const replyContent = cleanForChat(rawReply);
+      if (!rawReply && lastErr) {
+        throw lastErr;
+      }
+
+      const replyContent = cleanForChat(rawReply || "(AI không trả về nội dung văn bản)");
 
       const savedUserText = targetImageId
         ? `[Người dùng gửi 1 bức ảnh] ${contextualText || DEFAULT_IMAGE_PROMPT}`
