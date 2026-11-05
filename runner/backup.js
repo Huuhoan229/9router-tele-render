@@ -106,6 +106,7 @@ function buildBackupMap(dataDir) {
     "machine-id",
     "telebot-config.json",
     "zalo-credentials.json",
+    "chat-histories.json",
     "db.json",
     "auth/cli-secret",
     "db/.migrated-from-json",

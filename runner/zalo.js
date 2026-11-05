@@ -10,18 +10,18 @@ const {
   cleanForChat,
 } = require("./format");
 
-const MAX_HISTORY_MESSAGES = 20;
+const { createMemoryStore } = require("./memory");
 
-function createZaloManager({ port, dataDir, getApiKey, getDefaultModel, getSystemPrompt }) {
+function createZaloManager({ port, dataDir, memoryStore: sharedMemory, getApiKey, getDefaultModel, getSystemPrompt }) {
   const routerBase = (process.env.ROUTER_BASE_URL || `http://127.0.0.1:${port}/v1`).replace(/\/+$/, "");
   const credsPath = path.join(dataDir, "zalo-credentials.json");
   const configPath = path.join(dataDir, "telebot-config.json");
+  const memoryStore = sharedMemory || createMemoryStore(dataDir);
 
   let activeApi = null;
   let ownId = null;
   let accountName = "";
   let loginInProgress = false;
-  const histories = new Map(); // threadId -> Array<{ role, content }>
   const pendingImages = new Map(); // threadId -> { url, ts, timer }
 
   function readBotConfig() {
@@ -110,11 +110,10 @@ function createZaloManager({ port, dataDir, getApiKey, getDefaultModel, getSyste
     }
 
     const model = getDefaultModel() || "a";
-    const key = String(threadId);
-    const history = histories.get(key) || [];
-    let pushedTurn = false;
+    const memKey = `zalo:${threadId}`;
 
     try {
+      const priorHistory = memoryStore.getHistoryForRequest(memKey);
       let userContent = userText || DEFAULT_IMAGE_PROMPT;
       if (imageUrls.length > 0) {
         const dataUrls = [];
@@ -124,15 +123,12 @@ function createZaloManager({ port, dataDir, getApiKey, getDefaultModel, getSyste
         userContent = buildVisionContent(userText, dataUrls);
       }
 
-      history.push({ role: "user", content: userContent });
-      pushedTurn = true;
-      while (history.length > MAX_HISTORY_MESSAGES) {
-        history.shift();
-      }
-      histories.set(key, history);
-
       const sysPrompt = (getSystemPrompt ? getSystemPrompt() : "") || DEFAULT_CHAT_SYSTEM_PROMPT;
-      const messages = [{ role: "system", content: sysPrompt }, ...history];
+      const messages = [
+        { role: "system", content: sysPrompt },
+        ...priorHistory,
+        { role: "user", content: userContent },
+      ];
 
       const res = await fetch(`${routerBase}/chat/completions`, {
         method: "POST",
@@ -159,20 +155,14 @@ function createZaloManager({ port, dataDir, getApiKey, getDefaultModel, getSyste
         "(AI không trả về nội dung)";
       const reply = cleanForChat(rawReply);
 
-      if (imageUrls.length > 0 && history.length > 0) {
-        history[history.length - 1] = {
-          role: "user",
-          content: `[Người dùng gửi ảnh] ${userText || DEFAULT_IMAGE_PROMPT}`,
-        };
-      }
+      const savedUserText =
+        imageUrls.length > 0
+          ? `[Người dùng gửi ảnh] ${userText || DEFAULT_IMAGE_PROMPT}`
+          : userText || DEFAULT_IMAGE_PROMPT;
+      memoryStore.appendCompletedTurn(memKey, savedUserText, reply);
 
-      history.push({ role: "assistant", content: reply });
-      while (history.length > MAX_HISTORY_MESSAGES) {
-        history.shift();
-      }
       return reply;
     } catch (err) {
-      if (pushedTurn) history.pop();
       const visionHint =
         imageUrls.length > 0
           ? "\n(Lưu ý: Hãy chọn Model/Combo có hỗ trợ Vision hoặc bật Vision Adapter trên 9Router)"
@@ -235,7 +225,7 @@ function createZaloManager({ port, dataDir, getApiKey, getDefaultModel, getSyste
       }
 
       if (/^\/clear$/i.test(text)) {
-        histories.delete(threadKey);
+        memoryStore.clearThread(`zalo:${threadKey}`);
         pendingImages.delete(threadKey);
         await api.sendMessage({ msg: "🧹 Đã xóa lịch sử hội thoại Zalo!" }, message.threadId, message.type);
         return;
@@ -315,9 +305,19 @@ function createZaloManager({ port, dataDir, getApiKey, getDefaultModel, getSyste
 
       if (!text && !targetImageUrl) return;
 
+      const quotedMsgText = String(message.data?.quote?.msg || "").trim();
+      const senderLabel = isGroup && message.data?.dName ? `[${message.data.dName}]: ` : "";
+      let contextualText = text || "";
+      if (quotedMsgText) {
+        contextualText = `[Đang trả lời tin nhắn: "${quotedMsgText.slice(0, 600)}"]\n${contextualText}`;
+      }
+      if (senderLabel && contextualText) {
+        contextualText = `${senderLabel}${contextualText}`;
+      }
+
       const replyText = await callRouterAI(
         message.threadId,
-        text,
+        contextualText,
         targetImageUrl ? [targetImageUrl] : []
       );
       await sendZaloChunks(api, message, replyText);

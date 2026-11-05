@@ -3,6 +3,7 @@ const path = require("path");
 const https = require("https");
 const { backupToCloud } = require("./backup");
 const { createZaloManager } = require("./zalo");
+const { createMemoryStore } = require("./memory");
 const {
   DEFAULT_CHAT_SYSTEM_PROMPT,
   DEFAULT_IMAGE_PROMPT,
@@ -65,7 +66,7 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
   const configPath = path.join(dataDir, "telebot-config.json");
 
   let persisted = loadBotConfig(configPath);
-  const histories = new Map(); // chatId -> Array<{ role, content }>
+  const memoryStore = createMemoryStore(dataDir);
   const pendingImages = new Map(); // chatId -> { fileId, ts }
   let running = true;
   let pollAbort = null;
@@ -120,6 +121,7 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
       zaloManager = createZaloManager({
         port,
         dataDir,
+        memoryStore,
         getApiKey,
         getDefaultModel: () => getActiveModel("default") || "a",
         getSystemPrompt: () => getSystemPrompt("default"),
@@ -406,8 +408,18 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
     }
 
     if (cmd === "/clear" || cmd === "/new") {
-      histories.delete(String(chatId));
+      memoryStore.clearThread(`tg:${chatId}`);
+      pendingImages.delete(String(chatId));
       await sendReply(chatId, "🧹 Đã xóa lịch sử trò chuyện. Hãy bắt đầu chủ đề mới!");
+      return true;
+    }
+
+    if (cmd === "/context") {
+      const count = memoryStore.getMessageCount(`tg:${chatId}`);
+      await sendReply(
+        chatId,
+        `🧠 Đang ghi nhớ ${count} tin nhắn gần nhất trong cuộc trò chuyện này (tự lưu vĩnh viễn kể cả khi server restart).\nGõ /clear nếu muốn xóa ngữ cảnh.`
+      );
       return true;
     }
 
@@ -649,28 +661,36 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
       tgCall("sendChatAction", { chat_id: chatId, action: "typing" }).catch(() => {});
     }, 4000);
 
-    const key = String(chatId);
-    const history = histories.get(key) || [];
-    let pushedTurn = false;
+    const memKey = `tg:${chatId}`;
+
+    // Inject quoted message text if replying to an earlier message
+    const quotedText = (msg.reply_to_message?.text || msg.reply_to_message?.caption || "").trim();
+    const senderLabel = isGroup
+      ? `[${[msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(" ") || "Thành viên"}]: `
+      : "";
+
+    let contextualText = text || "";
+    if (quotedText) {
+      contextualText = `[Đang trả lời tin nhắn: "${quotedText.slice(0, 600)}"]\n${contextualText}`;
+    }
+    if (senderLabel && contextualText) {
+      contextualText = `${senderLabel}${contextualText}`;
+    }
 
     try {
-      let userMessageContent = text || DEFAULT_IMAGE_PROMPT;
+      const priorHistory = memoryStore.getHistoryForRequest(memKey);
+      let userMessageContent = contextualText || DEFAULT_IMAGE_PROMPT;
       if (targetImageId) {
         const dataUrl = await downloadTelegramFileAsDataUrl(targetImageId);
-        userMessageContent = buildVisionContent(text, [dataUrl]);
+        userMessageContent = buildVisionContent(contextualText, [dataUrl]);
       }
-
-      history.push({ role: "user", content: userMessageContent });
-      pushedTurn = true;
-      while (history.length > MAX_HISTORY_MESSAGES) {
-        history.shift();
-      }
-      histories.set(key, history);
 
       const sysPrompt = getSystemPrompt(chatId);
-      const messages = sysPrompt
-        ? [{ role: "system", content: sysPrompt }, ...history]
-        : [...history];
+      const messages = [
+        ...(sysPrompt ? [{ role: "system", content: sysPrompt }] : []),
+        ...priorHistory,
+        { role: "user", content: userMessageContent },
+      ];
 
       const res = await fetch(`${routerBase}/chat/completions`, {
         method: "POST",
@@ -697,22 +717,13 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
         "(AI không trả về nội dung văn bản)";
       const replyContent = cleanForChat(rawReply);
 
-      // Replace large base64 image in history with compact text note to save RAM & tokens
-      if (targetImageId && history.length > 0) {
-        history[history.length - 1] = {
-          role: "user",
-          content: `[Người dùng gửi 1 bức ảnh] ${text || DEFAULT_IMAGE_PROMPT}`,
-        };
-      }
-
-      history.push({ role: "assistant", content: replyContent });
-      while (history.length > MAX_HISTORY_MESSAGES) {
-        history.shift();
-      }
+      const savedUserText = targetImageId
+        ? `[Người dùng gửi 1 bức ảnh] ${contextualText || DEFAULT_IMAGE_PROMPT}`
+        : contextualText || DEFAULT_IMAGE_PROMPT;
+      memoryStore.appendCompletedTurn(memKey, savedUserText, replyContent);
 
       await sendReply(chatId, replyContent, replyExtra);
     } catch (err) {
-      if (pushedTurn) history.pop();
       const visionHint = targetImageId
         ? "\n💡 Lưu ý: Hãy chắc chắn Model/Combo đang chọn có hỗ trợ đọc ảnh (Vision) hoặc đã bật Vision Adapter trong 9Router."
         : "";
@@ -805,6 +816,10 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
   return {
     stop() {
       running = false;
+      try { memoryStore.flushToDisk(); } catch {}
+      if (zaloManager) {
+        try { zaloManager.stop(); } catch {}
+      }
       if (pollAbort) {
         try { pollAbort.abort(); } catch {}
       }
