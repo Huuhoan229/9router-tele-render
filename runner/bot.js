@@ -72,7 +72,7 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
   const pendingImages = new Map(); // chatId -> { fileId, ts }
   let running = true;
   let pollAbort = null;
-  let botUsername = "";
+  let botUsername = (process.env.TELEGRAM_BOT_USERNAME || "Trolyhoanhongbot").replace(/^@/, "");
   let botId = null;
 
   const allowedIds = (process.env.ALLOWED_TELEGRAM_IDS || "")
@@ -399,6 +399,8 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
       }
       const normalized = mode === "all" ? "all" : "tag";
       persisted.groupTagModes[String(chatId)] = normalized;
+      persisted.groupModes = persisted.groupModes || {};
+      persisted.groupModes[String(chatId)] = normalized === "all" ? "all" : "mention";
       saveBotConfig(configPath, persisted);
       backupToCloud(dataDir).catch(() => {});
       await sendReply(
@@ -565,9 +567,11 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
   }
 
   function isBotExplicitlyTagged(msg, text) {
-    if (botUsername) {
-      const mentionRegex = new RegExp(`@${botUsername}\\b`, "i");
-      if (mentionRegex.test(text || "")) return true;
+    const raw = String(text || "");
+    const targetUser = (botUsername || "Trolyhoanhongbot").replace(/^@/, "");
+    if (targetUser) {
+      const mentionRegex = new RegExp(`(^|[^a-z0-9_])@${targetUser}(?![a-z0-9_])`, "i");
+      if (mentionRegex.test(raw)) return true;
     }
     const entities = [
       ...(Array.isArray(msg.entities) ? msg.entities : []),
@@ -576,6 +580,12 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
     for (const ent of entities) {
       if (ent?.type === "text_mention" && botId && ent?.user?.id === botId) {
         return true;
+      }
+      if ((ent?.type === "mention" || ent?.type === "bot_command") && typeof ent.offset === "number" && typeof ent.length === "number") {
+        const slice = raw.slice(ent.offset, ent.offset + ent.length).toLowerCase();
+        if (targetUser && slice.includes(`@${targetUser.toLowerCase()}`)) {
+          return true;
+        }
       }
     }
     return false;
@@ -586,6 +596,14 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
     const userId = msg.from?.id;
     const isGroup = msg.chat.type === "group" || msg.chat.type === "supergroup";
     let text = (msg.text || msg.caption || "").trim();
+
+    if (!botId) {
+      try {
+        const me = await tgCall("getMe");
+        if (me?.username) botUsername = me.username;
+        if (me?.id) botId = me.id;
+      } catch {}
+    }
 
     const directImageId = extractTelegramImageFileId(msg);
     const repliedImageId = extractTelegramImageFileId(msg.reply_to_message);
@@ -615,7 +633,7 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
       }
 
       if (isTagged && botUsername) {
-        const mentionRegex = new RegExp(`@${botUsername}\\b`, "gi");
+        const mentionRegex = new RegExp(`@${botUsername}(?![a-z0-9_])`, "gi");
         if (!/^\/\S+@/i.test(text)) {
           text = text.replace(mentionRegex, "").trim();
         }
@@ -627,6 +645,11 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
           targetImageId = pending.fileId;
           pendingImages.delete(String(chatId));
         }
+      }
+
+      if (isTagged && !text && !targetImageId) {
+        const quoted = (msg.reply_to_message?.text || msg.reply_to_message?.caption || "").trim();
+        text = quoted ? "Hãy trả lời hoặc giải thích nội dung tin nhắn này." : "Xin chào";
       }
     }
 
