@@ -387,24 +387,25 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
     }
 
     if (cmd === "/groupmode") {
-      persisted.groupModes = persisted.groupModes || {};
+      persisted.groupTagModes = persisted.groupTagModes || {};
       const mode = argText.toLowerCase();
-      if (mode !== "all" && mode !== "mention") {
-        const cur = persisted.groupModes[String(chatId)] || "mention";
+      if (mode !== "all" && mode !== "mention" && mode !== "tag") {
+        const cur = persisted.groupTagModes[String(chatId)] || "tag";
         await sendReply(
           chatId,
-          `Chế độ nhóm hiện tại: ${cur}\n• Gõ /groupmode all để Bot trả lời MỌI tin nhắn trong nhóm (nhớ tắt Privacy ở @BotFather hoặc cấp quyền Admin cho Bot).\n• Gõ /groupmode mention để chỉ trả lời khi tag @${botUsername || "bot"}, Reply tin nhắn của bot, hoặc gõ /ask.`
+          `Chế độ nhóm hiện tại: ${cur}\n• Mặc định (tag/mention): Bot CHỈ trả lời khi được tag trực tiếp @${botUsername || "bot"} (không tag sẽ không trả lời để nhường cho bot Hermes).\n• Gõ /groupmode@${botUsername || "bot"} all nếu muốn Bot trả lời mọi tin nhắn trong nhóm.`
         );
         return true;
       }
-      persisted.groupModes[String(chatId)] = mode;
+      const normalized = mode === "all" ? "all" : "tag";
+      persisted.groupTagModes[String(chatId)] = normalized;
       saveBotConfig(configPath, persisted);
       backupToCloud(dataDir).catch(() => {});
       await sendReply(
         chatId,
-        mode === "all"
+        normalized === "all"
           ? "✅ Đã bật chế độ `all`: Bot sẽ trả lời mọi tin nhắn trong nhóm này!"
-          : "✅ Đã bật chế độ `mention`: Bot chỉ trả lời khi được tag, Reply, hoặc dùng `/ask`."
+          : `✅ Đã bật chế độ chỉ trả lời khi được tag \`@${botUsername || "bot"}\` (không tag không trả lời).`
       );
       return true;
     }
@@ -563,6 +564,23 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
     return downloadImageAsDataUrl(fileUrl);
   }
 
+  function isBotExplicitlyTagged(msg, text) {
+    if (botUsername) {
+      const mentionRegex = new RegExp(`@${botUsername}\\b`, "i");
+      if (mentionRegex.test(text || "")) return true;
+    }
+    const entities = [
+      ...(Array.isArray(msg.entities) ? msg.entities : []),
+      ...(Array.isArray(msg.caption_entities) ? msg.caption_entities : []),
+    ];
+    for (const ent of entities) {
+      if (ent?.type === "text_mention" && botId && ent?.user?.id === botId) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   async function handleChatMessage(msg) {
     const chatId = msg.chat.id;
     const userId = msg.from?.id;
@@ -583,6 +601,35 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
 
     let targetImageId = directImageId || repliedImageId || null;
 
+    // In group chats, strictly require @botUsername tag by default (unless groupTagModes[chatId] === "all")
+    // so Hermes can answer all untagged messages while this bot only answers when explicitly tagged.
+    if (isGroup) {
+      const groupMode = (persisted.groupTagModes && persisted.groupTagModes[String(chatId)]) || "tag";
+      const isTagged = isBotExplicitlyTagged(msg, text);
+
+      if (groupMode !== "all" && !isTagged) {
+        if (directImageId) {
+          pendingImages.set(String(chatId), { fileId: directImageId, ts: Date.now() });
+        }
+        return;
+      }
+
+      if (isTagged && botUsername) {
+        const mentionRegex = new RegExp(`@${botUsername}\\b`, "gi");
+        if (!/^\/\S+@/i.test(text)) {
+          text = text.replace(mentionRegex, "").trim();
+        }
+      }
+
+      if (!targetImageId) {
+        const pending = pendingImages.get(String(chatId));
+        if (pending && Date.now() - pending.ts < 2 * 60 * 1000) {
+          targetImageId = pending.fileId;
+          pendingImages.delete(String(chatId));
+        }
+      }
+    }
+
     // Handle /ask or /ai command in groups & private chat
     if (/^\/(ask|ai)(@\S+)?(\s+|$)/i.test(text)) {
       text = text.replace(/^\/(ask|ai)(@\S+)?\s*/i, "").trim();
@@ -602,33 +649,8 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
     } else if (text.startsWith("/")) {
       const handled = await handleCommand(msg, text);
       if (handled) return;
-    } else if (isGroup) {
-      const groupMode = (persisted.groupModes && persisted.groupModes[String(chatId)]) || "mention";
-      const isReplyToBot = Boolean(botId && msg.reply_to_message?.from?.id === botId);
-      const mentionRegex = botUsername ? new RegExp(`@${botUsername}\\b`, "i") : null;
-      const isMentioned = Boolean(mentionRegex && mentionRegex.test(text));
-
-      if (groupMode !== "all" && !isReplyToBot && !isMentioned) {
-        // Remember recent image in group for 2 minutes in case user types /ask right after
-        if (directImageId) {
-          pendingImages.set(String(chatId), { fileId: directImageId, ts: Date.now() });
-        }
-        return;
-      }
-
-      if (isMentioned && mentionRegex) {
-        text = text.replace(mentionRegex, "").trim();
-      }
-
-      if (!targetImageId) {
-        const pending = pendingImages.get(String(chatId));
-        if (pending && Date.now() - pending.ts < 2 * 60 * 1000) {
-          targetImageId = pending.fileId;
-          pendingImages.delete(String(chatId));
-        }
-      }
-
-      if (!text && !targetImageId) return;
+    } else if (isGroup && !text && !targetImageId) {
+      return;
     }
 
     if (targetImageId) {
