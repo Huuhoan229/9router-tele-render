@@ -37,6 +37,19 @@ function saveBotConfig(configPath, cfg) {
   }
 }
 
+function normalizeApiEndpoint(value) {
+  const parsed = new URL(String(value || "").trim());
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw new Error("Endpoint phải bắt đầu bằng http:// hoặc https://");
+  }
+  parsed.hash = "";
+  parsed.search = "";
+  parsed.pathname = parsed.pathname
+    .replace(/\/(chat\/completions|models)\/?$/i, "")
+    .replace(/\/+$/, "");
+  return parsed.toString().replace(/\/$/, "");
+}
+
 function splitLongText(text, maxLen = MAX_TELEGRAM_LENGTH) {
   if (!text || text.length <= maxLen) return [text || "(Trống)"];
   const chunks = [];
@@ -64,10 +77,13 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
   }
 
   const tgBase = `https://api.telegram.org/bot${botToken}`;
-  const routerBase = (process.env.ROUTER_BASE_URL || `http://127.0.0.1:${port}/v1`).replace(/\/+$/, "");
   const configPath = path.join(dataDir, "telebot-config.json");
 
   let persisted = loadBotConfig(configPath);
+  function getRouterBase() {
+    const configured = persisted.routerEndpoint || process.env.ROUTER_BASE_URL;
+    return (configured || `http://127.0.0.1:${port}/v1`).replace(/\/+$/, "");
+  }
   const memoryStore = createMemoryStore(dataDir);
   const pendingImages = new Map(); // chatId -> { fileId, ts }
   let running = true;
@@ -79,6 +95,9 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
+  if (allowedIds.length === 0) {
+    console.warn("[TeleBot] No ALLOWED_TELEGRAM_IDS configured; only /start and /help are available until an ID is added.");
+  }
 
   function getApiKey() {
     const manual = (persisted.routerApiKey || process.env.ROUTER_API_KEY || "").trim();
@@ -124,6 +143,7 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
         port,
         dataDir,
         memoryStore,
+        getRouterBase,
         getApiKey,
         getDefaultModel: () => getActiveModel("default") || "a",
         getSystemPrompt: () => getSystemPrompt("default"),
@@ -251,7 +271,7 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
     if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
 
     try {
-      const res = await fetch(`${routerBase}/models`, { headers });
+      const res = await fetch(`${getRouterBase()}/models`, { headers });
       if (res.ok) {
         const json = await res.json();
         const list = Array.isArray(json?.data) ? json.data : [];
@@ -280,7 +300,6 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
   }
 
   function isAuthorized(userId) {
-    if (allowedIds.length === 0) return true;
     return allowedIds.includes(String(userId));
   }
 
@@ -299,6 +318,8 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
         "",
         `• *Telegram ID của bạn:* \`${userId}\``,
         `• *Trạng thái API Key 9Router:* ${hasKey ? "✅ Đã kết nối" : "⚠️ Chưa gắn key (dùng /setkey)"}`,
+        `• *Endpoint AI:* ${getRouterBase()}`,
+        `• *Truy cập bot:* ${allowedIds.length ? "Đã giới hạn theo ALLOWED_TELEGRAM_IDS" : "Chưa cấp quyền; thêm Telegram ID bên dưới vào ALLOWED_TELEGRAM_IDS trên Render"}`,
         `• *Model đang dùng:* \`${currentModel}\``,
         "",
         "*Các lệnh điều khiển:*",
@@ -308,6 +329,8 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
         "• `/zalomode dm` | `command` | `all` | `off` — Chỉnh chế độ tự trả lời trên Zalo",
         "• `/zalostatus` — Kiểm tra trạng thái kết nối Zalo cá nhân",
         "• `/setkey <key>` — Gắn API Key tạo trong Dashboard 9Router",
+        "• `/endpoint` — Xem endpoint AI hiện tại",
+        "• `/setendpoint <url>` — Đổi endpoint OpenAI-compatible",
         "• `/models` — Hiện nút bấm chọn Model / Combo từ 9Router",
         "• `/model <tên_model>` — Nhập tay tên Model hoặc Combo",
         "• `/clear` — Xóa lịch sử hội thoại hiện tại",
@@ -443,6 +466,27 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
         chatId,
         "✅ Đã lưu API Key của 9Router! Gõ `/models` để chọn AI/Combo hoặc nhắn tin trực tiếp ngay."
       );
+      return true;
+    }
+
+    if (cmd === "/endpoint") {
+      await sendReply(chatId, `Endpoint AI hiện tại: ${getRouterBase()}\nĐổi bằng /setendpoint https://api.example.com/v1`);
+      return true;
+    }
+
+    if (cmd === "/setendpoint") {
+      if (!argText) {
+        await sendReply(chatId, "Cách dùng: /setendpoint https://api.example.com/v1");
+        return true;
+      }
+      try {
+        persisted.routerEndpoint = normalizeApiEndpoint(argText);
+        saveBotConfig(configPath, persisted);
+        backupToCloud(dataDir).catch(() => {});
+        await sendReply(chatId, `✅ Đã lưu endpoint AI: ${persisted.routerEndpoint}\nModel hiện tại: ${getActiveModel(chatId) || "(chưa chọn)"}`);
+      } catch (err) {
+        await sendReply(chatId, `⚠️ Endpoint không hợp lệ: ${err.message}`);
+      }
       return true;
     }
 
@@ -596,6 +640,7 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
     const userId = msg.from?.id;
     const isGroup = msg.chat.type === "group" || msg.chat.type === "supergroup";
     let text = (msg.text || msg.caption || "").trim();
+    const isSetupHelp = !isGroup && /^\/(start|help)(@\S+)?(?:\s|$)/i.test(text);
 
     if (!botId) {
       try {
@@ -610,9 +655,9 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
 
     if (!text && !directImageId) return;
 
-    if (!isAuthorized(userId)) {
+    if (!isAuthorized(userId) && !isSetupHelp) {
       if (!isGroup) {
-        await sendReply(chatId, `⛔ Bạn không có quyền sử dụng bot này (ID của bạn: ${userId}).`);
+        await sendReply(chatId, `⛔ ID của bạn là ${userId}. Hãy thêm ID này vào ALLOWED_TELEGRAM_IDS trong Render để sử dụng bot.`);
       }
       return;
     }
@@ -624,8 +669,9 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
     if (isGroup) {
       const groupMode = (persisted.groupTagModes && persisted.groupTagModes[String(chatId)]) || "tag";
       const isTagged = isBotExplicitlyTagged(msg, text);
+      const isAskCommand = /^\/(ask|ai)(@\S+)?(\s+|$)/i.test(text);
 
-      if (groupMode !== "all" && !isTagged) {
+      if (groupMode !== "all" && !isTagged && !isAskCommand) {
         if (directImageId) {
           pendingImages.set(String(chatId), { fileId: directImageId, ts: Date.now() });
         }
@@ -748,7 +794,7 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
 
       for (const candidate of candidateModels) {
         try {
-          const res = await fetch(`${routerBase}/chat/completions`, {
+          const res = await fetch(`${getRouterBase()}/chat/completions`, {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
@@ -846,7 +892,7 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
       const me = await tgCall("getMe");
       botUsername = me.username || "";
       botId = me.id || null;
-      console.log(`[TeleBot] Started successfully as @${me.username} (connected to ${routerBase})`);
+      console.log(`[TeleBot] Started successfully as @${me.username} (connected to ${getRouterBase()})`);
     } catch (err) {
       console.error("[TeleBot] Startup check failed (check TELEGRAM_BOT_TOKEN):", err.message);
     }
@@ -879,8 +925,13 @@ function startTelegramBot({ port, dataDir, zaloManager }) {
       } catch (err) {
         if (!running) break;
         if (err.name !== "AbortError") {
-          console.error("[TeleBot] Poll error (retrying in 5s):", err.message);
-          await new Promise((r) => setTimeout(r, 5000));
+          const conflict = /409|terminated by other getUpdates request/i.test(err.message || "");
+          if (conflict) {
+            console.error("[TeleBot] Telegram polling conflict: another running service is using this bot token. Keep only one poller per token.", err.message);
+          } else {
+            console.error("[TeleBot] Poll error (retrying):", err.message);
+          }
+          await new Promise((r) => setTimeout(r, conflict ? 30000 : 5000));
         }
       }
     }

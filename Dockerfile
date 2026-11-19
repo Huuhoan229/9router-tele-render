@@ -10,7 +10,8 @@ RUN mkdir -p /app/data /home/node && \
 
 # Copy runner scripts and install Zalo Personal Bot library (zca-js)
 COPY --chown=node:node runner/package.json /app/runner/package.json
-RUN cd /app/runner && npm install --omit=dev --no-audit --no-fund && chown -R node:node /app/runner
+COPY --chown=node:node runner/package-lock.json /app/runner/package-lock.json
+RUN cd /app/runner && npm ci --omit=dev --no-audit --no-fund && chown -R node:node /app/runner
 
 COPY --chown=node:node runner/ /app/runner/
 

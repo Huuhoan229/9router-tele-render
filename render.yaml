@@ -25,5 +25,7 @@ services:
         sync: false
       - key: TELEGRAM_BOT_TOKEN
         sync: false
+      - key: ALLOWED_TELEGRAM_IDS
+        sync: false
       - key: GITHUB_TOKEN
         sync: false

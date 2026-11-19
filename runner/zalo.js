@@ -14,8 +14,10 @@ const {
 
 const { createMemoryStore } = require("./memory");
 
-function createZaloManager({ port, dataDir, memoryStore: sharedMemory, getApiKey, getDefaultModel, getSystemPrompt }) {
-  const routerBase = (process.env.ROUTER_BASE_URL || `http://127.0.0.1:${port}/v1`).replace(/\/+$/, "");
+function createZaloManager({ port, dataDir, memoryStore: sharedMemory, getRouterBase, getApiKey, getDefaultModel, getSystemPrompt }) {
+  const resolveRouterBase =
+    getRouterBase ||
+    (() => (process.env.ROUTER_BASE_URL || `http://127.0.0.1:${port}/v1`).replace(/\/+$/, ""));
   const credsPath = path.join(dataDir, "zalo-credentials.json");
   const configPath = path.join(dataDir, "telebot-config.json");
   const memoryStore = sharedMemory || createMemoryStore(dataDir);
@@ -140,7 +142,7 @@ function createZaloManager({ port, dataDir, memoryStore: sharedMemory, getApiKey
 
       for (const candidate of candidateModels) {
         try {
-          const res = await fetch(`${routerBase}/chat/completions`, {
+          const res = await fetch(`${resolveRouterBase()}/chat/completions`, {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
