@@ -1,5 +1,7 @@
 # 9Router + Telegram AI Chatbox on Render
 
+> Nếu đang dùng bot quản lý từ repo `Zalo-to-Tele-cli`, có thể giữ service này làm API AI riêng. Trong chế độ đó, xóa `TELEGRAM_BOT_TOKEN` khỏi Environment của service này và cấu hình URL `/v1`, API key, model của 9Router trong service bridge. Chỉ một service nên polling updates của mỗi Telegram bot token.
+
 Bộ project đóng gói chung **`decolua/9router:latest`** + **Telegram Bot** + **Tự động giữ cấu hình qua GitHub Secret Gist** chạy gọn trong **1 Docker Web Service Free duy nhất** trên Render.
 
 ---
@@ -70,6 +72,12 @@ Render Free tự sleep sau 15 phút không có request web đến service. Ping 
 Lưu ý: Render cấp 750 giờ Free cho cả workspace mỗi tháng. Nếu bạn giữ cả bot này và bridge Zalo chạy liên tục, hai service cần khoảng 1.500 giờ/tháng; một workspace Free không đủ chạy cả hai 24/7. Nếu service sleep, Telegram polling và Zalo listener cũng dừng cho đến khi có request đánh thức service.
 
 Đặt `ALLOWED_TELEGRAM_IDS` bằng Telegram user ID của bạn để bật sử dụng bot và giới hạn ai có thể thay endpoint, key, model. Khi danh sách để trống, chỉ `/start` và `/help` hoạt động để người dùng xem ID của mình.
+
+### Dùng service này làm AI backend cho Zalo-to-Tele
+
+Có thể giữ service 9Router này chạy riêng và để bot quản lý/bridge Telegram ở repo `Zalo-to-Tele-cli` gọi API `/v1/chat/completions` của nó. Trong Render Environment của service bridge, đặt `AI_BASE_URL` bằng URL Render của service này cộng `/v1`, rồi điền `AI_API_KEY` và `AI_MODEL`.
+
+Để service này chỉ chạy 9Router API, xóa `TELEGRAM_BOT_TOKEN` khỏi Environment của service 9Router. Chỉ để cùng token Telegram ở service bridge; hai tiến trình polling bằng một token sẽ tranh nhau nhận updates. Có thể giữ các biến `GITHUB_TOKEN`, `INITIAL_PASSWORD` và backup Gist của repo này để giữ dữ liệu SQLite của 9Router.
 
 ---
 
