@@ -75,7 +75,7 @@ Lưu ý: Render cấp 750 giờ Free cho cả workspace mỗi tháng. Nếu bạ
 
 ### Dùng service này làm AI backend cho Zalo-to-Tele
 
-Có thể giữ service 9Router này chạy riêng và để bot quản lý/bridge Telegram ở repo `Zalo-to-Tele-cli` gọi API `/v1/chat/completions` của nó. Trong Render Environment của service bridge, đặt `AI_BASE_URL` bằng URL Render của service này cộng `/v1`, rồi điền `AI_API_KEY` và `AI_MODEL`.
+Mô hình hiện tại: repo `Zalo-to-Tele-cli` chạy trên **Koyeb**, dùng **MongoDB**; service 9Router này chạy trên **Render**. Bot quản lý/bridge trên Koyeb gọi API `/v1/chat/completions` của 9Router. Trong **Koyeb → service bridge → Settings → Environment variables and files**, đặt `AI_BASE_URL` bằng URL Render của service này cộng `/v1`, rồi điền `AI_API_KEY`, `AI_MODEL` và `TELEGRAM_ADMIN_IDS`. Giữ nguyên các biến MongoDB cũ trên Koyeb.
 
 Để service này chỉ chạy 9Router API, xóa `TELEGRAM_BOT_TOKEN` khỏi Environment của service 9Router. Chỉ để cùng token Telegram ở service bridge; hai tiến trình polling bằng một token sẽ tranh nhau nhận updates. Có thể giữ các biến `GITHUB_TOKEN`, `INITIAL_PASSWORD` và backup Gist của repo này để giữ dữ liệu SQLite của 9Router.
 
